@@ -178,9 +178,16 @@ export interface ConversionBase {
     scanPlain?: Record<string, string>;
     /**
      * The old folder is gone and everything pushed into it late was brought
-     * into the converted vault (or no other device existed).
+     * into the converted vault (or no other device existed), except `skipped`.
      */
     cleaned: boolean;
+    /**
+     * Late versions the cleanup could not bring in (files the converting device
+     * leaves out, changed in the vault meanwhile): cloud hash in the old folder,
+     * by path. The device that pushed one keeps it as a conflict copy when it
+     * follows, as before the cleanup.
+     */
+    skipped?: Record<string, string>;
 }
 
 export const NO_CONVERSION_BASE: ConversionBase = { paths: {}, cleaned: false };
@@ -215,16 +222,19 @@ export function parseConversionBase(text: string): ConversionBase {
             ids?: unknown;
             scanPlain?: unknown;
             cleaned?: unknown;
+            skipped?: unknown;
         };
         const scan = stringMap(doc.scan);
         const ids = stringMap(doc.ids);
         const scanPlain = stringMap(doc.scanPlain);
+        const skipped = stringMap(doc.skipped);
         return {
             paths: stringMap(doc.paths) ?? {},
             ...(scan ? { scan } : {}),
             ...(ids ? { ids } : {}),
             ...(scanPlain ? { scanPlain } : {}),
             cleaned: doc.cleaned === true,
+            ...(skipped ? { skipped } : {}),
         };
     } catch {
         return { ...NO_CONVERSION_BASE };
@@ -411,7 +421,8 @@ export async function rebaseOntoVaultFolder(
         // or sent into the old folder too late (the one here is newer). The old
         // folder tells: its file still holds this device's version in the second case.
         const mine = old.hash?.toLowerCase();
-        if (!same && base.scan && !base.cleaned && mine && old.fileId && base.scan[from ?? path]?.toLowerCase() !== mine) {
+        const lateKnown = !base.cleaned || base.skipped?.[from ?? path]?.toLowerCase() === mine;
+        if (!same && base.scan && lateKnown && mine && old.fileId && base.scan[from ?? path]?.toLowerCase() !== mine) {
             const there = (await oldVersionNow(old.fileId))?.toLowerCase() ?? null;
             // The late version is an edit of what the conversion read. When the vault
             // still holds exactly that, the content here goes up as an edit of it.

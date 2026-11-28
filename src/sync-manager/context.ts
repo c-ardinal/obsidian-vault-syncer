@@ -79,6 +79,7 @@ export interface SyncFlags {
     vaultLockService?: {
         checkForLockFile(): Promise<boolean>;
         restoreLockFileIfMissing?(): Promise<"present" | "restored" | "lost">;
+        getMigrationLock?(): Promise<{ deviceId: string; timestamp: number } | null>;
     };
     /** The file system treats NFC and NFD names as one file (macOS / iOS) */
     unicodeInsensitiveFs?: boolean;

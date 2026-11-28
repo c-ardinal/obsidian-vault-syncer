@@ -1,4 +1,5 @@
 import { capabilitiesOf, type CloudChanges, type CloudFile } from "../types/adapter";
+import { noteRecordChange } from "./device-registry";
 import { isQuietCycle, takePeekedChanges } from "./change-peek";
 import { removeRemote } from "./remote-deletion";
 import { PlanDecision, reviewPlan } from "./sync-plan";
@@ -1196,6 +1197,7 @@ export async function pullViaChangesAPI(
             retryCandidates.delete(c.fileId);
             seenFileIds.add(c.fileId);
             if (c.file?.path === ctx.pluginDataPath) remoteIndexChanged = true;
+            noteRecordChange(ctx, c);
         }
 
         // Announced before the page is planned: planning renames notes apart too, and

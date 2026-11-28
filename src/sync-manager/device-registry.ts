@@ -213,8 +213,8 @@ export async function publishDeviceRecordIfDue(ctx: DeviceCtx, now = Date.now())
     }
 }
 
-/** Records of all devices on the cloud, latest sync first */
-export async function listDevices(ctx: DeviceCtx): Promise<DeviceRecord[]> {
+/** The record files on the cloud, one per device (not read) */
+async function recordFiles(ctx: DeviceCtx) {
     const dirPath = `${ctx.pluginDir}/${DEVICE_DIR}`;
     const dir = await ctx.adapter.getFileMetadata(dirPath);
     // Without a folder entry (clouds that keep no folders), look through the whole listing
@@ -222,9 +222,59 @@ export async function listDevices(ctx: DeviceCtx): Promise<DeviceRecord[]> {
         dir?.kind === "folder" && dir.id
             ? (await ctx.adapter.listFiles(dir.id)).filter((f) => !f.path.includes("/"))
             : (await ctx.adapter.listFiles()).filter((f) => f.path.startsWith(dirPath + "/"));
+    return files.filter((f) => f.kind === "file" && f.path.endsWith(".json"));
+}
+
+/**
+ * True when the cloud holds this device's record and no other. Decided by the
+ * file names alone, so that a record that cannot be read still counts as
+ * another device. A failed listing throws.
+ */
+export async function onlyThisDeviceRecorded(ctx: DeviceCtx): Promise<boolean> {
+    const own = `${ctx.deviceId}.json`;
+    const names = (await recordFiles(ctx)).map((f) => f.path.slice(f.path.lastIndexOf("/") + 1));
+    return names.includes(own) && names.every((n) => n === own);
+}
+
+/**
+ * Before the first sync of a session sends anything: this device's record is
+ * written now if the cloud has none (a new device, or one forgotten on
+ * another device). A device that converts the vault keeps the old folder for
+ * a while only when it sees another device's record, so the record has to be
+ * there before this device can push into that folder. True when it was
+ * written now; a failed write throws (nothing is sent without it).
+ */
+export async function registerDeviceIfMissing(ctx: DeviceCtx): Promise<boolean> {
+    if (!ctx.deviceId) return false;
+    const s = stateOf(ctx);
+    if (s.loaded) return false;
+    await loadOwn(ctx, s);
+    if (s.ownFileId) return false;
+    s.lastPublish = 0; // due now, whatever was written before
+    if (!(await publishDeviceRecordIfDue(ctx))) {
+        throw new Error("This device's record could not be written to the cloud. Nothing is sent until it is.");
+    }
+    return true;
+}
+
+/**
+ * A change of the change feed: when it removes this device's record (another
+ * device forgot this one), the record is written again before this device
+ * sends anything (registerDeviceIfMissing).
+ */
+export function noteRecordChange(ctx: Pick<DeviceCtx, "pluginDir" | "deviceId">, change: { fileId: string; removed?: boolean; file?: { path: string } }): void {
+    const s = states.get(ctx);
+    if (!s?.ownFileId || change.fileId !== s.ownFileId) return;
+    if (!change.removed && change.file?.path === deviceRecordPath(ctx, ctx.deviceId)) return;
+    s.ownFileId = null;
+    s.loaded = false;
+}
+
+/** Records of all devices on the cloud, latest sync first */
+export async function listDevices(ctx: DeviceCtx): Promise<DeviceRecord[]> {
+    const files = await recordFiles(ctx);
     const records: DeviceRecord[] = [];
     for (const f of files) {
-        if (f.kind !== "file" || !f.path.endsWith(".json")) continue;
         try {
             const r = parseRecord(new TextDecoder().decode(await ctx.adapter.downloadFile(f.id)));
             if (r) records.push(r);
