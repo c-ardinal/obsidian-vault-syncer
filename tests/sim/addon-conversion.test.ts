@@ -523,7 +523,7 @@ describe("vault converted while another device runs (Drive)", () => {
          * still sending when B is about to swap the folders: what A changed
          * (by default a new note and an edit) reaches the old folder only.
          */
-        async function latePush(change?: (a: SimDevice) => Promise<void>) {
+        async function latePush(change?: (a: SimDevice, round: (times?: number) => Promise<void>) => Promise<void>) {
             const t = await setup();
             const a = await t.make("A");
             const b = await t.make("B");
@@ -535,7 +535,7 @@ describe("vault converted while another device runs (Drive)", () => {
             await a.dev.userCreate("one.md", "one\n");
             await a.dev.userCreate("two.md", "two\n");
             await round(2);
-            if (change) await change(a.dev);
+            if (change) await change(a.dev, round);
             else {
                 await a.dev.userCreate("late.md", "late\n");
                 await a.dev.userEdit("one.md", "one\nlate edit on A\n");
@@ -686,6 +686,34 @@ describe("vault converted while another device runs (Drive)", () => {
             await s.round();
             expect(s.c.dev.userFiles()["late.md"]).toBe("late\n");
             expect(s.b.dev.userFiles()["late.md"]).toBe("late\n");
+            s.noErrors();
+        });
+
+        it("a note deleted and made again with the same content before it was pushed late is kept", async () => {
+            const s = await latePush(async (a, round) => {
+                await a.userDelete("two.md");
+                await round();
+                await a.userCreate("two.md", "two\n");
+            });
+            await s.follow(s.c);
+            await s.follow(s.a);
+            await s.round();
+            await s.cleanUp();
+            for (const x of [s.a, s.b, s.c]) expect(x.dev.userFiles()["two.md"], x.dev.name).toBe("two\n");
+            s.noErrors();
+        });
+
+        it("a note deleted and made again with the same content is kept when its device follows after the cleanup", async () => {
+            const s = await latePush(async (a, round) => {
+                await a.userDelete("two.md");
+                await round();
+                await a.userCreate("two.md", "two\n");
+            });
+            await s.follow(s.c);
+            await s.cleanUp();
+            await s.follow(s.a);
+            await s.round();
+            for (const x of [s.a, s.b, s.c]) expect(x.dev.userFiles()["two.md"], x.dev.name).toBe("two\n");
             s.noErrors();
         });
 

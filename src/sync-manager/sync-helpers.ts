@@ -193,6 +193,16 @@ export async function deletedVersionOnCloud(ctx: SyncHelpersCtx, path: string, p
     return Object.values(parsed.deleted ?? {}).some((m) => m?.path === path && m.plain === want);
 }
 
+/**
+ * The vault folder was replaced: the marks known so far name files of the old
+ * folder, deleted before the conversion read it. A note made again under such a
+ * name and content is a new note, not the deleted version. Only the marks of the
+ * new folder count from now on (read with its index).
+ */
+export function forgetDeletionMarks(ctx: object): void {
+    knownDeletionMarks.delete(ctx);
+}
+
 /** The mark another device (or we) left when deleting `fileId`, if known. */
 export function deletionMarkOf(ctx: object, fileId: string): DeletionMark | undefined {
     return knownDeletionMarks.get(ctx)?.[fileId];

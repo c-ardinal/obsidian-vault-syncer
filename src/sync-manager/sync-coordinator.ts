@@ -18,7 +18,7 @@ import {
 } from "./vault-folder";
 import { REMOTE_FILES } from "./remote-layout";
 import { hashContent } from "./file-utils";
-import { deletedVersionKnown, downloadRemoteIndex, markIndexUploadOwed, noteDeletionMark } from "./sync-helpers";
+import { deletedVersionKnown, downloadRemoteIndex, forgetDeletionMarks, markIndexUploadOwed, noteDeletionMark } from "./sync-helpers";
 import {
     SYNC_POST_PUSH_PULL_MAX_RETRIES,
     SCAN_FULL_SCAN_CHUNK_SIZE,
@@ -160,6 +160,7 @@ export async function executeSmartSync(ctx: SyncContext, scanVault: boolean): Pr
         const folderReplaced = await followVaultFolder(
             ctx,
             async () => {
+                forgetDeletionMarks(ctx);
                 const meta = await ctx.adapter.getFileMetadata(ctx.pluginDataPath);
                 return meta ? await downloadRemoteIndex(ctx, meta.id) : {};
             },

@@ -18,7 +18,7 @@ import { markDeleted, saveIndex, saveLocalIndex } from "../sync-manager/state";
 import { SyncContext } from "../sync-manager/context";
 import { onlyThisDeviceRecorded } from "../sync-manager/device-registry";
 import { conversionBaseOf, parseConversionBase, restoreKnownVaultRoot } from "../sync-manager/vault-folder";
-import { deletedVersionKnown, markIndexUploadOwed, refreshDeletionMarks, relistForOthersAdd } from "../sync-manager/sync-helpers";
+import { deletedVersionKnown, forgetDeletionMarks, markIndexUploadOwed, refreshDeletionMarks, relistForOthersAdd } from "../sync-manager/sync-helpers";
 import { REMOTE_FILES } from "../sync-manager/remote-layout";
 
 interface MigrationProgress {
@@ -926,6 +926,7 @@ export class MigrationService {
         // This is CRITICAL to prevent syncing into the Backup folder (which has the old ID)
         this.baseAdapter.reset();
         restoreKnownVaultRoot(this.ctx, tempId);
+        forgetDeletionMarks(this.ctx);
 
         await saveLocalIndex(this.ctx);
         await saveIndex(this.ctx);
