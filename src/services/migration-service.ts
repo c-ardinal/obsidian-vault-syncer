@@ -16,7 +16,7 @@ import {
 import { freeConflictCopyPath } from "../sync-manager/conflict-resolution";
 import { markDeleted, saveIndex, saveLocalIndex } from "../sync-manager/state";
 import { SyncContext } from "../sync-manager/context";
-import { listDevices } from "../sync-manager/device-registry";
+import { onlyThisDeviceRecorded } from "../sync-manager/device-registry";
 import { conversionBaseOf, parseConversionBase, restoreKnownVaultRoot } from "../sync-manager/vault-folder";
 import { deletedVersionKnown, markIndexUploadOwed, refreshDeletionMarks, relistForOthersAdd } from "../sync-manager/sync-helpers";
 import { REMOTE_FILES } from "../sync-manager/remote-layout";
@@ -52,6 +52,8 @@ export interface PendingBackupCleanup {
     ids?: Record<string, string>;
     /** The converted vault's file of each path at the swap: cloud id and hash */
     converted?: Record<string, { id: string; hash: string }>;
+    /** Late versions the cleanup could not bring in (ConversionBase.skipped) */
+    skipped?: Record<string, string>;
 }
 
 export class MigrationService {
@@ -599,8 +601,10 @@ export class MigrationService {
             for (const f of files) {
                 if (f.kind !== "file" || f.path === MIGRATION_LOCK_FILENAME) continue;
                 if (shouldIgnore(this.ctx, f.path)) {
+                    seen.add(f.path);
                     if (this.leftOutHereOnly(f.path) && !(f.hash && rec.scan[f.path] === f.hash)) {
                         await this.carryLateLeftOut(backup, f, rec);
+                        await this.savePendingCleanup(rec);
                     }
                     continue;
                 }
@@ -647,8 +651,16 @@ export class MigrationService {
                 );
             }
             for (const path of Object.keys(rec.scan)) {
-                // Left out of sync since (scope changed): not a deletion
-                if (seen.has(path) || shouldIgnore(this.ctx, path)) continue;
+                if (seen.has(path)) continue;
+                if (shouldIgnore(this.ctx, path)) {
+                    if (this.leftOutHereOnly(path)) {
+                        await this.deleteLateLeftOut(path, rec, movedTo);
+                        delete rec.scan[path];
+                        await this.savePendingCleanup(rec);
+                    }
+                    // (left out of sync since the conversion, scope changed: not a deletion)
+                    continue;
+                }
                 const localNow = await this.localHash(path);
                 if (localNow === null || localNow !== rec.base[path]) continue; // the edit here wins
                 // A deletion made before the swap is carried out on the file the
@@ -670,7 +682,7 @@ export class MigrationService {
             }
             // Everything pushed into the old folder late is here now: the devices that
             // follow from now on need not look into it (and it is about to go)
-            await this.markConversionCleaned();
+            await this.markConversionCleaned(rec.skipped);
             await remoteDeletionOf(this.ctx).remove(
                 this.baseAdapter,
                 { id: rec.backupId, path: rec.backupName, kind: "folder" },
@@ -688,30 +700,64 @@ export class MigrationService {
 
     /**
      * A file this device leaves out, pushed into the old folder late: taken over
-     * from cloud to cloud when the vault still holds what the conversion made
-     * of it (or nothing under this name). Otherwise the vault moved on, and the
-     * device that pushed it settles the two versions when it follows.
+     * from cloud to cloud. It replaces what the conversion made of it when the
+     * vault still holds exactly that, and takes the name again when the vault
+     * holds nothing under it (the late edit outweighs a deletion, as for any
+     * note). Otherwise the vault moved on meanwhile, and the two versions are
+     * concurrent: conflict copies stay on the device that holds the note, so the
+     * late version is recorded as skipped, and the device that pushed it keeps
+     * it as a copy when it follows.
      */
     private async carryLateLeftOut(
         backup: CloudAdapter,
-        f: { id: string; path: string; mtime: number },
+        f: { id: string; path: string; mtime: number; hash?: string },
         rec: PendingBackupCleanup,
     ): Promise<void> {
-        const conv = rec.converted?.[f.path];
-        if (conv) {
-            const cur = await this.ctx.adapter.getFileMetadataById(conv.id, f.path);
-            if (!cur || cur.path !== f.path || cur.hash?.toLowerCase() !== conv.hash.toLowerCase()) return;
-        } else if (await this.ctx.adapter.getFileMetadata(f.path)) return;
         const content = await backup.downloadFile(f.id);
-        if (deletedVersionKnown(this.ctx, f.path, await hashContent(content))) return;
+        const plain = await hashContent(content);
+        if (deletedVersionKnown(this.ctx, f.path, plain)) return;
+        const conv = rec.converted?.[f.path];
+        const cur = conv ? await this.ctx.adapter.getFileMetadataById(conv.id, f.path) : null;
+        const untouched = !!conv && !!cur && cur.path === f.path && cur.hash?.toLowerCase() === conv.hash.toLowerCase();
+        if (!untouched && (await this.ctx.adapter.getFileMetadata(f.path))) {
+            if (this.ctx.index[f.path]?.plainHash === plain || !f.hash) return; // the vault holds this very version
+            rec.skipped = { ...rec.skipped, [f.path]: f.hash };
+            await this.ctx.log(
+                `[Migration] ${f.path} (left out on this device) changed in the vault and late on another device: that device keeps its version as a copy.`,
+                "info",
+            );
+            return;
+        }
         // (this device's own index never lists a file it leaves out: the shared
         // index is told through the list kept for that)
-        relistForOthersAdd(this.ctx, f.path, await this.carryOver(this.ctx.adapter, f.path, content, f.mtime, conv?.id));
+        const entry = await this.carryOver(this.ctx.adapter, f.path, content, f.mtime, untouched ? conv!.id : undefined);
+        this.ctx.index[f.path] = entry;
+        relistForOthersAdd(this.ctx, f.path, entry);
         markIndexUploadOwed(this.ctx);
         await this.ctx.log(`[Migration] Brought ${f.path} (left out on this device) over from the old folder.`, "info");
     }
 
-    private async markConversionCleaned(): Promise<void> {
+    /**
+     * A file this device leaves out, deleted (or renamed) in the old folder after
+     * the conversion read it: deleted in the vault too, when the vault still
+     * holds exactly what the conversion made of it. Nothing of it is here.
+     */
+    private async deleteLateLeftOut(path: string, rec: PendingBackupCleanup, movedTo: Map<string, string>): Promise<void> {
+        const conv = rec.converted?.[path];
+        if (!conv) return;
+        const cur = await this.ctx.adapter.getFileMetadataById(conv.id, path);
+        if (!cur || cur.path !== path || cur.hash?.toLowerCase() !== conv.hash.toLowerCase()) return;
+        // Renamed late: only once the file is in the vault under its new name
+        const oldId = rec.ids?.[path];
+        const newPath = oldId ? movedTo.get(oldId) : undefined;
+        if (newPath !== undefined && !(await this.ctx.adapter.getFileMetadata(newPath))) return;
+        await remoteDeletionOf(this.ctx).remove(this.ctx.adapter, { id: conv.id, path, kind: "file" }, "user-file");
+        delete this.ctx.index[path];
+        markIndexUploadOwed(this.ctx);
+        await this.ctx.log(`[Migration] ${path} (left out on this device) was deleted late on another device: deleted it in the vault too.`, "info");
+    }
+
+    private async markConversionCleaned(skipped?: Record<string, string>): Promise<void> {
         const path = `${this.ctx.pluginDir}/${REMOTE_FILES.conversionBase}`;
         const meta = await this.ctx.adapter.getFileMetadata(path);
         if (!meta) return;
@@ -719,7 +765,7 @@ export class MigrationService {
         if (base.cleaned) return;
         await this.ctx.adapter.uploadFile(
             path,
-            new TextEncoder().encode(JSON.stringify({ ...base, cleaned: true })).buffer,
+            new TextEncoder().encode(JSON.stringify({ ...base, cleaned: true, ...(skipped ? { skipped } : {}) })).buffer,
             Date.now(),
             meta.id,
         );
@@ -898,21 +944,21 @@ export class MigrationService {
 
     /**
      * True when the device records on the cloud show no device but this one.
-     * Every device writes its record at the first sync of a session, so a device
-     * that could still be pushing has one. Unknown (records unreadable) counts
-     * as "others exist".
+     * Every device writes its record before the first sync of a session sends
+     * anything, and reads the migration lock after that (a new record starts
+     * the sync over): a device that could still push into the old folder has a
+     * record by now. A record that cannot be read, or a listing that fails,
+     * counts as "others exist".
      */
     private async isSoleDevice(): Promise<boolean> {
         try {
-            const records = await listDevices({
+            return await onlyThisDeviceRecorded({
                 adapter: this.baseAdapter,
                 vault: this.ctx.vault,
                 pluginDir: this.ctx.pluginDir,
                 deviceId: this.ctx.deviceId,
                 log: this.ctx.log,
             });
-            // No record at all tells nothing: only this device's own record, alone, does
-            return records.length > 0 && records.every((r) => r.id === this.ctx.deviceId);
         } catch (e) {
             await this.ctx.log(`[Migration] Device records could not be read: ${String(e)}`, "warn");
             return false;

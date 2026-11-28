@@ -6,8 +6,11 @@ import {
     getDeviceName,
     listDevices,
     mergeActivity,
+    noteRecordChange,
+    onlyThisDeviceRecorded,
     publishDeviceRecordIfDue,
     recordActivity,
+    registerDeviceIfMissing,
     type DeviceCtx,
 } from "../../../src/sync-manager/device-registry";
 import { isManagedSeparately, setPluginDir } from "../../../src/sync-manager/file-utils";
@@ -107,3 +110,49 @@ describe("device registry", () => {
         expect(isManagedSeparately(".obsidian/plugins/cardinal-vault-syncer/data/remote/other.json")).toBe(false);
     });
 });
+
+describe("registration before a device sends anything", () => {
+    it("writes the record once when the cloud has none", async () => {
+        const cloud = new MockCloudAdapter();
+        const ctx = makeCtx(cloud, "devA");
+        expect(await registerDeviceIfMissing(ctx)).toBe(true);
+        expect(await registerDeviceIfMissing(ctx)).toBe(false);
+        expect(ctx.uploads()).toBe(1);
+        expect(await onlyThisDeviceRecorded(ctx)).toBe(true);
+    });
+
+    it("tries again at the next sync after a failed write", async () => {
+        const cloud = new MockCloudAdapter();
+        const ctx = makeCtx(cloud, "devA");
+        const upload = cloud.uploadFile.bind(cloud);
+        cloud.uploadFile = async () => {
+            throw new Error("offline");
+        };
+        await expect(registerDeviceIfMissing(ctx)).rejects.toThrow();
+        await expect(registerDeviceIfMissing(ctx)).rejects.toThrow();
+        expect(ctx.uploads()).toBe(2);
+        cloud.uploadFile = upload;
+        expect(await registerDeviceIfMissing(ctx)).toBe(true);
+        expect(await onlyThisDeviceRecorded(ctx)).toBe(true);
+    });
+
+    it("writes the record again once the change feed shows it removed", async () => {
+        const cloud = new MockCloudAdapter();
+        const ctx = makeCtx(cloud, "devA");
+        await registerDeviceIfMissing(ctx);
+        const meta = await cloud.getFileMetadata(deviceRecordPath(ctx, "devA"));
+        await cloud.deleteFile(meta!.id);
+        noteRecordChange(ctx, { fileId: meta!.id, removed: true });
+        expect(await registerDeviceIfMissing(ctx)).toBe(true);
+        expect(await onlyThisDeviceRecorded(ctx)).toBe(true);
+    });
+
+    it("counts a record of another device that cannot be read", async () => {
+        const cloud = new MockCloudAdapter();
+        const a = makeCtx(cloud, "devA");
+        await registerDeviceIfMissing(a);
+        await cloud.uploadFile(deviceRecordPath(a, "devB"), new TextEncoder().encode("{").buffer, T0);
+        expect(await onlyThisDeviceRecorded(a)).toBe(false);
+    });
+});
+

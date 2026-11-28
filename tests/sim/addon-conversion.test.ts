@@ -1217,6 +1217,125 @@ describe("vault converted while another device runs (Drive)", () => {
     });
 
     /** The converting device leaves some files out of its own sync */
+    describe("the converting device decides whether another device may still push into the old folder", () => {
+        /**
+         * B is the only device with a record when it converts. A, new to the
+         * vault, began its first sync before B created the migration lock, and
+         * sends while B is about to swap the folders.
+         */
+        async function firstSyncDuringConversion() {
+            const t = await setup();
+            const b = await t.make("B");
+            await b.dev.userCreate("one.md", "one\n");
+            for (let i = 0; i < 2; i++) await t.sync(b.dev);
+            const a = await t.make("A");
+            await a.dev.userCreate("from-a.md", "written on A before its first sync\n");
+            const lock = b.dev.sm.vaultLockService;
+            const rename = lock.renameFolder.bind(lock);
+            let pushed = false;
+            lock.renameFolder = async (id: string, name: string) => {
+                if (!pushed) {
+                    pushed = true;
+                    // A's request read the migration lock before B created it
+                    const aLock = a.dev.sm.vaultLockService;
+                    const check = aLock.getMigrationLock.bind(aLock);
+                    let first = true;
+                    aLock.getMigrationLock = async () => {
+                        if (first) {
+                            first = false;
+                            return null;
+                        }
+                        return check();
+                    };
+                    await t.sync(a.dev);
+                    aLock.getMigrationLock = check;
+                }
+                return rename(id, name);
+            };
+            await t.convert(b.dev);
+            return { t, a, b };
+        }
+
+        it("a device on its first sync is not lost when the old folder could be deleted at once", async () => {
+            const { t, a, b } = await firstSyncDuringConversion();
+            await t.sync(a.dev);
+            await a.engine.unlockVault("LOCK", PASSWORD);
+            vi.setSystemTime(Date.now() + 2 * 60 * 60 * 1000);
+            for (let i = 0; i < 3; i++) for (const x of [a, b]) await t.sync(x.dev);
+            const want = { "one.md": "one\n", "from-a.md": "written on A before its first sync\n" };
+            expect(a.dev.userFiles()).toEqual(want);
+            expect(b.dev.userFiles()).toEqual(want);
+            expect(a.dev.syncErrors).toEqual([]);
+            expect(b.dev.syncErrors).toEqual([]);
+            for (const [p, bytes] of Object.entries(t.vaultFiles())) expect(decryptable(bytes), p).toBe(true);
+        });
+
+        for (const when of ["running", "restarted"] as const) {
+            it(`an edit of a device forgotten on the converting device is not lost (forgotten device ${when})`, async () => {
+                const t = await setup();
+                const a = await t.make("A");
+                const b = await t.make("B");
+                await a.dev.userCreate("one.md", "one\n");
+                for (let i = 0; i < 2; i++) for (const x of [a, b]) await t.sync(x.dev);
+                await b.dev.sm.forgetDevice(a.dev.sm.deviceId);
+                if (when === "restarted") await a.dev.restart();
+                await a.dev.userEdit("one.md", "one\nedited on A\n");
+                const lock = b.dev.sm.vaultLockService;
+                const rename = lock.renameFolder.bind(lock);
+                let pushed = false;
+                lock.renameFolder = async (id: string, name: string) => {
+                    if (!pushed) {
+                        pushed = true;
+                        // A's request read the migration lock before B created it
+                        const aLock = a.dev.sm.vaultLockService;
+                        const check = aLock.getMigrationLock.bind(aLock);
+                        let first = true;
+                        aLock.getMigrationLock = async () => {
+                            if (first) {
+                                first = false;
+                                return null;
+                            }
+                            return check();
+                        };
+                        await t.sync(a.dev);
+                        aLock.getMigrationLock = check;
+                    }
+                    return rename(id, name);
+                };
+                await t.convert(b.dev);
+                await t.sync(a.dev);
+                await a.engine.unlockVault("LOCK", PASSWORD);
+                vi.setSystemTime(Date.now() + 2 * 60 * 60 * 1000);
+                for (let i = 0; i < 3; i++) for (const x of [a, b]) await t.sync(x.dev);
+                expect(a.dev.userFiles()).toEqual({ "one.md": "one\nedited on A\n" });
+                expect(b.dev.userFiles()).toEqual({ "one.md": "one\nedited on A\n" });
+                expect(a.dev.syncErrors).toEqual([]);
+                expect(b.dev.syncErrors).toEqual([]);
+                for (const [p, bytes] of Object.entries(t.vaultFiles())) expect(decryptable(bytes), p).toBe(true);
+            });
+        }
+
+        it("a device record that cannot be read still keeps the old folder", async () => {
+            const t = await setup();
+            const a = await t.make("A");
+            const b = await t.make("B");
+            await a.dev.userCreate("one.md", "one\n");
+            for (let i = 0; i < 2; i++) for (const x of [a, b]) await t.sync(x.dev);
+            // A's record is there, but reading it fails when B converts
+            const record = t.items().find((i) => t.pathOf(i).endsWith(`/${a.dev.sm.deviceId}.json`));
+            expect(record, "A's record").toBeDefined();
+            const base = b.dev.sm.baseAdapter as unknown as { downloadFile(id: string): Promise<ArrayBuffer> };
+            const download = base.downloadFile.bind(base);
+            base.downloadFile = async (id: string) => {
+                if (id === record!.id) throw new Error("transient read failure");
+                return download(id);
+            };
+            await t.convert(b.dev);
+            base.downloadFile = download;
+            expect(t.folderNames().filter((n) => n.includes("-Backup-")), "kept for the grace time").toHaveLength(1);
+        });
+    });
+
     describe("files the converting device leaves out by its own settings", () => {
         it("a late edit of such a file is brought over by the cleanup when its device never comes back", async () => {
             const t = await setup();
@@ -1260,6 +1379,85 @@ describe("vault converted while another device runs (Drive)", () => {
             expect(c.dev.syncErrors).toEqual([]);
             for (const [p, bytes] of Object.entries(t.vaultFiles())) expect(decryptable(bytes), p).toBe(true);
         });
+
+        /**
+         * B leaves private/** out. A and C hold private/secret.md. A's sync read
+         * the locks before B created the migration lock and sends `late` while
+         * B is about to swap the folders.
+         */
+        async function lateLeftOut(late: (a: SimDevice) => Promise<void>) {
+            const t = await setup();
+            const a = await t.make("A");
+            const b = await t.make("B");
+            const c = await t.make("C");
+            b.dev.settings.exclusionPatterns = "private/**";
+            await a.dev.userCreate("one.md", "one\n");
+            await a.dev.userCreate("private/secret.md", "secret\n");
+            for (let i = 0; i < 2; i++) for (const x of [a, b, c]) await t.sync(x.dev);
+            expect(Object.keys(c.dev.userFiles()).sort()).toEqual(["one.md", "private/secret.md"]);
+            await late(a.dev);
+            const lock = b.dev.sm.vaultLockService;
+            const rename = lock.renameFolder.bind(lock);
+            let pushed = false;
+            lock.renameFolder = async (id: string, name: string) => {
+                if (!pushed) {
+                    pushed = true;
+                    const aLock = a.dev.sm.vaultLockService;
+                    const check = aLock.getMigrationLock.bind(aLock);
+                    aLock.getMigrationLock = async () => null;
+                    await t.sync(a.dev);
+                    aLock.getMigrationLock = check;
+                }
+                return rename(id, name);
+            };
+            await t.convert(b.dev);
+            const follow = async (x: { dev: SimDevice; engine: { unlockVault(l: string, p: string): Promise<unknown> } }) => {
+                await t.sync(x.dev);
+                await x.engine.unlockVault("LOCK", PASSWORD);
+                await t.sync(x.dev);
+            };
+            const cleanUp = async () => {
+                vi.setSystemTime(Date.now() + 2 * 60 * 60 * 1000);
+                for (let i = 0; i < 2; i++) await t.sync(b.dev);
+                expect(t.folderNames().filter((n) => n.includes("-Backup-")), "the old folder is gone").toEqual([]);
+            };
+            const noErrors = () => {
+                for (const x of [a, b, c]) expect(x.dev.syncErrors, x.dev.name).toEqual([]);
+                for (const [p, bytes] of Object.entries(t.vaultFiles())) expect(decryptable(bytes), p).toBe(true);
+            };
+            return { t, a, b, c, follow, cleanUp, noErrors };
+        }
+
+        it("a late edit of such a file is kept as a copy when the vault changed it too before the cleanup", async () => {
+            const s = await lateLeftOut((a) => a.userEdit("private/secret.md", "secret\nlate edit on A\n"));
+            await s.follow(s.c);
+            await s.c.dev.userEdit("private/secret.md", "secret\nedited on C\n");
+            await s.t.sync(s.c.dev);
+            await s.cleanUp();
+            await s.follow(s.a);
+            for (let i = 0; i < 3; i++) for (const x of [s.a, s.b, s.c]) await s.t.sync(x.dev);
+            const files = s.a.dev.userFiles();
+            expect(files["private/secret.md"]).toBe("secret\nedited on C\n");
+            // (conflict copies stay on the device that holds the note)
+            expect(Object.values(files), "the late edit is kept on its device").toContain("secret\nlate edit on A\n");
+            expect(s.c.dev.userFiles()).toEqual({ "one.md": "one\n", "private/secret.md": "secret\nedited on C\n" });
+            expect(Object.keys(s.b.dev.userFiles())).toEqual(["one.md"]);
+            s.noErrors();
+        });
+
+        for (const back of ["follows after the cleanup", "never comes back"] as const) {
+            it(`a late deletion of such a file is carried out by the cleanup (its device ${back})`, async () => {
+                const s = await lateLeftOut((a) => a.userDelete("private/secret.md"));
+                await s.follow(s.c);
+                await s.cleanUp();
+                const devices = back === "never comes back" ? [s.b, s.c] : [s.a, s.b, s.c];
+                if (back !== "never comes back") await s.follow(s.a);
+                for (let i = 0; i < 3; i++) for (const x of devices) await s.t.sync(x.dev);
+                for (const x of devices.filter((d) => d !== s.b)) expect(x.dev.userFiles(), x.dev.name).toEqual({ "one.md": "one\n" });
+                expect(Object.keys(s.t.vaultFiles()).filter((p) => p.startsWith("private/"))).toEqual([]);
+                for (const x of devices) expect(x.dev.syncErrors, x.dev.name).toEqual([]);
+            });
+        }
 
         for (const holder of ["stays", "never comes back"] as const) {
             it(`are in the converted vault all the same (the device that holds them ${holder})`, async () => {

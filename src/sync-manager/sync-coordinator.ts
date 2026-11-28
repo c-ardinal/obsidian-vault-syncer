@@ -29,7 +29,8 @@ import { purgeTrashIfDue } from "./remote-trash";
 import { prepareFirstSync } from "./first-sync";
 import { keepRevisionsIfDue } from "./revision-retention";
 import { checkStorageIfDue } from "./storage-check";
-import { publishDeviceRecordIfDue } from "./device-registry";
+import { publishDeviceRecordIfDue, registerDeviceIfMissing } from "./device-registry";
+import { MIGRATION_LOCK_STALE_MS } from "../services/vault-lock-service";
 import { migratePlainHashes } from "./plain-hash-migration";
 import { reconcileScopeChange } from "./sync-pull";
 import { noteScopeAtSyncEnd } from "./sync-scope";
@@ -261,6 +262,24 @@ export async function executeSmartSync(ctx: SyncContext, scanVault: boolean): Pr
             delete ctx.localIndex[path];
             ctx.dirtyPaths.delete(path);
             await ctx.log(`[Vault Folder] ${path} was deleted in the vault in the version held here: deleted here, not sent again.`, "info");
+        }
+        // A device that converts the vault judges by the device records whether
+        // anyone may still push into the old folder: this device's record is
+        // there before it sends anything (written again when the pull above saw it
+        // removed), and the migration lock is read again after it (the check at
+        // the start of the request came before it).
+        // (A converted vault is not converted again: nothing to do there.)
+        if (!ctx.e2eeEnabled && (await registerDeviceIfMissing(ctx))) {
+            const lock = (await ctx.vaultLockService?.getMigrationLock?.()) ?? null;
+            if (lock && lock.deviceId !== ctx.deviceId && lock.timestamp > Date.now() - MIGRATION_LOCK_STALE_MS) {
+                await ctx.log(`Sync skipped: device ${lock.deviceId} is converting this vault.`, "warn");
+                // As for a lock seen at the start of a request: the folder is
+                // looked up again, it is about to be replaced
+                ctx.adapter.reset();
+                await ctx.notify("noticeVaultConverting");
+                ctx.progress?.finish("ok");
+                return;
+            }
         }
         const pushed = await ctx.smartPush(scanVault);
         if (scanVault) scanDone.add(ctx);
