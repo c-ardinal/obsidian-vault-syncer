@@ -35,6 +35,7 @@ import { migratePlainHashes } from "./plain-hash-migration";
 import { reconcileScopeChange } from "./sync-pull";
 import { noteScopeAtSyncEnd } from "./sync-scope";
 import { CtxFlag } from "./context-state";
+import { reviewPlan } from "./sync-plan";
 
 
 /**
@@ -257,7 +258,18 @@ export async function executeSmartSync(ctx: SyncContext, scanVault: boolean): Pr
             async (path) => ((await ctx.vault.exists(path)) ? hashContent(await ctx.vault.readBinary(path)) : undefined),
             (path, plain) => deletedVersionKnown(ctx, path, plain),
         );
+        // Reviewed like any other pull deletion: many at once ask before files are
+        // trashed. A held one is kept and sent again, as a note edited here would be.
+        const deletionReview = await reviewPlan(ctx, {
+            step: "pull",
+            changes: deletedSince.map((path) => ({ action: "delete-local", path, kind: "file" })),
+        });
         for (const path of deletedSince) {
+            if (!deletionReview.allows("delete-local", path)) {
+                ctx.dirtyPaths.set(path, Date.now());
+                await ctx.log(`[Vault Folder] ${path} was deleted in the vault in the version held here: kept here (held back), sent again.`, "info");
+                continue;
+            }
             const file = ctx.vault.getAbstractFileByPath(path);
             if (file) await ctx.vault.trashFile(file, true);
             delete ctx.localIndex[path];

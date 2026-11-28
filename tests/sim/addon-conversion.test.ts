@@ -47,6 +47,7 @@ import { createMockEngine, MOCK_TAG_SIZE } from "../helpers/mock-crypto-engine";
 import { DecryptionError } from "../../src/encryption/errors";
 import type { CloudAdapter } from "../../src/types/adapter";
 import type { ICryptoEngine } from "../../src/encryption/interfaces";
+import { PlanDecision } from "../../src/sync-manager/sync-plan";
 
 const PASSWORD = "pw";
 
@@ -628,6 +629,39 @@ describe("vault converted while another device runs (Drive)", () => {
             await s.round();
             expect(Object.keys(s.everywhere()).sort(), "the deleted note does not come back").toEqual(["one.md", "two.md"]);
             expect(Object.keys(s.t.vaultFiles()).filter((p) => !p.startsWith(".obsidian/")).sort()).toEqual(["one.md", "two.md"]);
+            s.noErrors();
+        });
+
+        it("the deletion on its device is reviewed like any other: held back, the note is kept and sent again", async () => {
+            const s = await latePush(async (a) => a.userCreate("late.md", "late\n"));
+            await s.t.sync(s.a.dev);
+            await s.a.engine.unlockVault("LOCK", PASSWORD);
+            const push = s.a.dev.sm.smartPush.bind(s.a.dev.sm);
+            s.a.dev.sm.smartPush = async () => {
+                throw new Error("app closed");
+            };
+            await s.a.dev.startSync("manual-sync", false).catch(() => {});
+            await vi.advanceTimersByTimeAsync(1000);
+            s.a.dev.sm.smartPush = push;
+            s.a.dev.syncErrors.length = 0;
+            await s.follow(s.c);
+            vi.setSystemTime(Date.now() + 2 * HOUR);
+            for (let i = 0; i < 2; i++) for (const x of [s.b, s.c]) await s.t.sync(x.dev);
+            await s.c.dev.userDelete("late.md");
+            for (let i = 0; i < 2; i++) for (const x of [s.c, s.b]) await s.t.sync(x.dev);
+            await s.a.dev.restart();
+            const reviewed: string[][] = [];
+            s.a.dev.sm.planGuard = {
+                review: async (plan) => {
+                    reviewed.push(plan.changes.filter((c) => c.action === "delete-local").map((c) => c.path));
+                    return PlanDecision.holdAll(plan);
+                },
+            };
+            await s.a.engine.unlockVault("LOCK", PASSWORD);
+            await s.round();
+            expect(reviewed.flat()).toContain("late.md");
+            expect(s.a.dev.userFiles()["late.md"], "kept on the device that held it back").toBe("late\n");
+            expect(s.c.dev.userFiles()["late.md"], "sent again").toBe("late\n");
             s.noErrors();
         });
 
