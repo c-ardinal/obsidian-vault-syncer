@@ -247,7 +247,10 @@ export async function onlyThisDeviceRecorded(ctx: DeviceCtx): Promise<boolean> {
 export async function registerDeviceIfMissing(ctx: DeviceCtx): Promise<boolean> {
     if (!ctx.deviceId) return false;
     const s = stateOf(ctx);
-    if (s.loaded) return false;
+    // Skipped only while the record is known to be there: after a failed write
+    // (or a removal seen in the change feed) it is looked up and written again
+    if (s.loaded && s.ownFileId) return false;
+    s.loaded = false;
     await loadOwn(ctx, s);
     if (s.ownFileId) return false;
     s.lastPublish = 0; // due now, whatever was written before
