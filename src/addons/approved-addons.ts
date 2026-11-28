@@ -47,16 +47,20 @@ export const APPROVED_ADDONS: ApprovedAddon[] = [
         downloadUrl: "https://github.com/c-ardinal/obsidian-vault-syncer-e2ee-engine/releases/latest",
         source: {
             repo: "c-ardinal/obsidian-vault-syncer-e2ee-engine",
-            // 0.19.2
-            commit: "a6bc83f64f1a6160edfaeb8607c2872b0cafc268",
+            // 0.19.4
+            commit: "d26bb99e5d407ea96852edbd201bbc5b1e727201",
         },
         files: {
-            "addon.json": "61bde8a64ac452e05ef26c40a662bdcbf0ff16e602691d1422a252c810197c5c",
-            "e2ee-engine.js": "6f112253403a2e575a51eec087411de8dceb2b534d9008da13315a678144391d",
+            "addon.json": "9ab2029120eefe4d58e5e6e1c5d3973ee12e741bdd5a4d62fcebb5a609db35a6",
+            "e2ee-engine.js": "17569fddf00f885d050e63f07839cb3d01b1e9e6a4197fbfc2bd88983e049ece",
             "TERMS.md": "12b4525dd2a3dcde2758470c53f74cd8d65ff71c74ffd8a2351ee039191ecf14",
             "TERMS_ja.md": "ba7a50d0d9e4ee0c0a3696683c33dc8a4f316a39ba51909a87f20e1528114f36",
         },
         retiredEntryHashes: [
+            // 0.19.3
+            "d3fd03d325b5d85c4da2bd279365373f2c95465c6b63dd2fbbdbbd8ececa32d9",
+            // 0.19.2
+            "6f112253403a2e575a51eec087411de8dceb2b534d9008da13315a678144391d",
             // 0.19.0
             "9b0c2d618892f80921261b774f9fd88de0c26df9ed17ea82a4225d7429aca83d",
             // 0.18.0

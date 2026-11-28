@@ -3,8 +3,22 @@ import { cloudHashMatches, contentFingerprint } from "./content-fingerprint";
 import type { SyncContext } from "./context";
 import type { SyncState } from "./types";
 import { ALWAYS_SHOW_ACTIVITY, TRIGGER_PRIORITY } from "./notification-matrix";
-import { getLocalFiles, shouldIgnore } from "./file-utils";
-import { saveIndex, beginSyncCycle, endSyncCycle } from "./state";
+import { ensureLocalFolder, getLocalFiles, shouldIgnore } from "./file-utils";
+import { freeConflictCopyPath } from "./conflict-resolution";
+import { markDeleted, saveIndex, saveLocalIndex, beginSyncCycle, endSyncCycle } from "./state";
+import {
+    followVaultFolder,
+    isVaultFolderRestart,
+    NO_CONVERSION_BASE,
+    knownVaultRootOf,
+    parseConversionBase,
+    rememberResent,
+    resentDeletedSince,
+    VaultConvertedError,
+} from "./vault-folder";
+import { REMOTE_FILES } from "./remote-layout";
+import { hashContent } from "./file-utils";
+import { deletedVersionKnown, downloadRemoteIndex, forgetDeletionMarks, markIndexUploadOwed, noteDeletionMark } from "./sync-helpers";
 import {
     SYNC_POST_PUSH_PULL_MAX_RETRIES,
     SCAN_FULL_SCAN_CHUNK_SIZE,
@@ -15,11 +29,13 @@ import { purgeTrashIfDue } from "./remote-trash";
 import { prepareFirstSync } from "./first-sync";
 import { keepRevisionsIfDue } from "./revision-retention";
 import { checkStorageIfDue } from "./storage-check";
-import { publishDeviceRecordIfDue } from "./device-registry";
+import { publishDeviceRecordIfDue, registerDeviceIfMissing } from "./device-registry";
+import { MIGRATION_LOCK_STALE_MS } from "../services/vault-lock-service";
 import { migratePlainHashes } from "./plain-hash-migration";
 import { reconcileScopeChange } from "./sync-pull";
 import { noteScopeAtSyncEnd } from "./sync-scope";
 import { CtxFlag } from "./context-state";
+import { reviewPlan } from "./sync-plan";
 
 
 /**
@@ -139,6 +155,77 @@ export async function executeSmartSync(ctx: SyncContext, scanVault: boolean): Pr
             await ctx.adapter.initialize();
         }
 
+        // Before anything else reads the indexes: they may describe a vault
+        // folder another device has replaced meanwhile
+        const knownRoot = knownVaultRootOf(ctx);
+        const folderReplaced = await followVaultFolder(
+            ctx,
+            async () => {
+                forgetDeletionMarks(ctx);
+                const meta = await ctx.adapter.getFileMetadata(ctx.pluginDataPath);
+                return meta ? await downloadRemoteIndex(ctx, meta.id) : {};
+            },
+            async () => {
+                // The new folder is a converted vault this device has not unlocked:
+                // its files cannot be read as they are. The sync stops here, and the
+                // check before the next sync finds the vault-lock and asks for it.
+                if (!ctx.e2eeEnabled && (await ctx.vaultLockService?.checkForLockFile())) {
+                    throw new VaultConvertedError();
+                }
+                // A converted vault whose folder was deleted or renamed by hand is
+                // rebuilt by the devices; the lock went with the old folder
+                if (ctx.e2eeEnabled && ctx.vaultLockService?.restoreLockFileIfMissing) {
+                    const lock = await ctx.vaultLockService.restoreLockFileIfMissing();
+                    if (lock === "restored") {
+                        await ctx.log("[Vault Folder] The new folder had no vault-lock: restored it from this device's copy.", "warn");
+                    } else if (lock === "lost") {
+                        throw new Error(
+                            "The cloud vault folder was replaced by one without a vault-lock, and this device holds no copy of it. Nothing is uploaded: open the add-on's settings on a device that was unlocked before.",
+                        );
+                    }
+                }
+            },
+            async () => {
+                const meta = await ctx.adapter.getFileMetadata(`${ctx.pluginDir}/${REMOTE_FILES.conversionBase}`);
+                if (!meta) return NO_CONVERSION_BASE;
+                return parseConversionBase(new TextDecoder().decode(await ctx.adapter.downloadFile(meta.id)));
+            },
+            async (path) => {
+                if (!(await ctx.vault.exists(path))) return undefined;
+                return hashContent(await ctx.vault.readBinary(path));
+            },
+            async (fileId) => {
+                if (!ctx.adapter.getContentHashById) return null;
+                return ctx.adapter.getContentHashById(fileId);
+            },
+            async (result) => {
+                for (const note of result.deletedHere) {
+                    // The device that cleans up the old folder reads the marks first
+                    noteDeletionMark(ctx, note.fileId, note.hash, { path: note.path, plain: note.plain });
+                    markIndexUploadOwed(ctx);
+                }
+                for (const path of result.lateHere) ctx.dirtyPaths.set(path, Date.now());
+                for (const note of result.resent) rememberResent(ctx, note.path, note.plain);
+                for (const path of result.deletedLate) markDeleted(ctx, path);
+                for (const path of result.unsure) {
+                    const copy = await freeConflictCopyPath((p) => ctx.vault.exists(p), path);
+                    await ensureLocalFolder(ctx, copy);
+                    await ctx.vault.writeBinary(copy, await ctx.vault.readBinary(path));
+                    ctx.dirtyPaths.set(copy, Date.now());
+                    await ctx.log(
+                        `[Vault Folder] ${path}: the version here was not converted and the vault holds another one. Kept the content here as ${copy}.`,
+                        "warn",
+                    );
+                }
+            },
+            (path, plain) => deletedVersionKnown(ctx, path, plain),
+        );
+        if (folderReplaced) {
+            await saveIndex(ctx);
+            scanVault = true;
+        }
+        if (folderReplaced || knownVaultRootOf(ctx) !== knownRoot) await saveLocalIndex(ctx, true);
+
         if ((await migratePlainHashes(ctx)) > 0) await saveIndex(ctx);
 
         if (!(await prepareFirstSync(ctx))) {
@@ -163,6 +250,50 @@ export async function executeSmartSync(ctx: SyncContext, scanVault: boolean): Pr
         // New files a scan held back (a rename event might still explain them) are
         // only looked at again by a scan: without one they were never uploaded.
         if (holdsNewFiles(ctx)) scanVault = true;
+        // Followed into a replaced vault folder lately: a note to be sent again may
+        // have been carried over and deleted there meanwhile (the pull above read
+        // the vault's deletion marks)
+        const deletedSince = await resentDeletedSince(
+            ctx,
+            async (path) => ((await ctx.vault.exists(path)) ? hashContent(await ctx.vault.readBinary(path)) : undefined),
+            (path, plain) => deletedVersionKnown(ctx, path, plain),
+        );
+        // Reviewed like any other pull deletion: many at once ask before files are
+        // trashed. A held one is kept and sent again, as a note edited here would be.
+        const deletionReview = await reviewPlan(ctx, {
+            step: "pull",
+            changes: deletedSince.map((path) => ({ action: "delete-local", path, kind: "file" })),
+        });
+        for (const path of deletedSince) {
+            if (!deletionReview.allows("delete-local", path)) {
+                ctx.dirtyPaths.set(path, Date.now());
+                await ctx.log(`[Vault Folder] ${path} was deleted in the vault in the version held here: kept here (held back), sent again.`, "info");
+                continue;
+            }
+            const file = ctx.vault.getAbstractFileByPath(path);
+            if (file) await ctx.vault.trashFile(file, true);
+            delete ctx.localIndex[path];
+            ctx.dirtyPaths.delete(path);
+            await ctx.log(`[Vault Folder] ${path} was deleted in the vault in the version held here: deleted here, not sent again.`, "info");
+        }
+        // A device that converts the vault judges by the device records whether
+        // anyone may still push into the old folder: this device's record is
+        // there before it sends anything (written again when the pull above saw it
+        // removed), and the migration lock is read again after it (the check at
+        // the start of the request came before it).
+        // (A converted vault is not converted again: nothing to do there.)
+        if (!ctx.e2eeEnabled && (await registerDeviceIfMissing(ctx))) {
+            const lock = (await ctx.vaultLockService?.getMigrationLock?.()) ?? null;
+            if (lock && lock.deviceId !== ctx.deviceId && lock.timestamp > Date.now() - MIGRATION_LOCK_STALE_MS) {
+                await ctx.log(`Sync skipped: device ${lock.deviceId} is converting this vault.`, "warn");
+                // As for a lock seen at the start of a request: the folder is
+                // looked up again, it is about to be replaced
+                ctx.adapter.reset();
+                await ctx.notify("noticeVaultConverting");
+                ctx.progress?.finish("ok");
+                return;
+            }
+        }
         const pushed = await ctx.smartPush(scanVault);
         if (scanVault) scanDone.add(ctx);
 
@@ -190,6 +321,12 @@ export async function executeSmartSync(ctx: SyncContext, scanVault: boolean): Pr
         await ctx.log("=== SMART SYNC COMPLETED ===", "info");
         ctx.progress?.finish("ok");
     } catch (e) {
+        if (isVaultFolderRestart(e)) {
+            // Not a failure: the caller starts over with the new vault folder
+            await ctx.log(`Smart Sync stopped: ${e instanceof Error ? e.message : String(e)}`, "system");
+            ctx.progress?.finish("ok");
+            throw e;
+        }
         await ctx.log(`Smart Sync failed: ${String(e)}`, "error");
         const notice = syncErrorNotice(e);
         ctx.progress?.finish(
