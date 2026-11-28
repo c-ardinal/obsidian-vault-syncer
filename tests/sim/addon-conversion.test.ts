@@ -524,7 +524,7 @@ describe("vault converted while another device runs (Drive)", () => {
          * still sending when B is about to swap the folders: what A changed
          * (by default a new note and an edit) reaches the old folder only.
          */
-        async function latePush(change?: (a: SimDevice, round: (times?: number) => Promise<void>) => Promise<void>) {
+        async function latePush(change?: (a: SimDevice, round: (times?: number) => Promise<void>) => Promise<unknown>) {
             const t = await setup();
             const a = await t.make("A");
             const b = await t.make("B");
@@ -748,6 +748,33 @@ describe("vault converted while another device runs (Drive)", () => {
             await s.follow(s.a);
             await s.round();
             for (const x of [s.a, s.b, s.c]) expect(x.dev.userFiles()["two.md"], x.dev.name).toBe("two\n");
+            s.noErrors();
+        });
+
+        it("a late edit taken by the cleanup is not lost when the converting device fails to send it", async () => {
+            const s = await latePush();
+            await s.follow(s.c);
+            // B takes A's late versions, and its sync fails before they are sent
+            vi.setSystemTime(Date.now() + 2 * HOUR);
+            const push = s.b.dev.sm.smartPush.bind(s.b.dev.sm);
+            s.b.dev.sm.smartPush = async () => {
+                throw new Error("network down");
+            };
+            await s.b.dev.startSync("manual-sync", false).catch(() => {});
+            await vi.advanceTimersByTimeAsync(1000);
+            s.b.dev.syncErrors.length = 0;
+            // A follows meanwhile
+            await s.follow(s.a);
+            expect(s.a.dev.userFiles()["one.md"], "A keeps its late edit").toBe("one\nlate edit on A\n");
+            s.b.dev.sm.smartPush = push;
+            await s.round();
+            await s.t.sync(s.b.dev);
+            await s.round();
+            for (const x of [s.a, s.b, s.c]) {
+                expect(x.dev.userFiles()["one.md"], x.dev.name).toBe("one\nlate edit on A\n");
+                expect(x.dev.userFiles()["late.md"], x.dev.name).toBe("late\n");
+            }
+            expect(s.t.folderNames().filter((n) => n.includes("-Backup-")), "the old folder is gone in the end").toEqual([]);
             s.noErrors();
         });
 

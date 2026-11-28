@@ -54,6 +54,12 @@ export interface PendingBackupCleanup {
     converted?: Record<string, { id: string; hash: string }>;
     /** Late versions the cleanup could not bring in (ConversionBase.skipped) */
     skipped?: Record<string, string>;
+    /**
+     * Late versions the cleanup took into this device's vault, not yet on the
+     * cloud: path -> content hash. The cleanup is finished only once the sync has
+     * sent them; until then a device that follows still finds them in the old folder.
+     */
+    taken?: Record<string, string>;
 }
 
 export class MigrationService {
@@ -99,6 +105,8 @@ export class MigrationService {
     private cleanupRunning = false;
     /** The folders were looked at since the app started (see recoverInterruptedSwap) */
     private swapChecked = false;
+    /** The last cleanup took late versions that the sync after it has to send first */
+    cleanupWaitsForSync = false;
     public isMigrating = false;
     public currentProgress: MigrationProgress | null = null;
 
@@ -639,6 +647,11 @@ export class MigrationService {
                 if (!untouched) await ensureLocalFolder(this.ctx, target);
                 await this.ctx.vault.writeBinary(target, content);
                 this.ctx.dirtyPaths.set(target, Date.now());
+                // An untouched note goes up with this sync. A conflict copy stays on
+                // this device: the device that pushed the late version keeps its own
+                // as a copy too when it follows (as for a skipped one)
+                if (untouched) rec.taken = { ...rec.taken, [target]: remotePlain };
+                else if (f.hash) rec.skipped = { ...rec.skipped, [f.path]: f.hash };
                 // Taken: a retry after a later failure must not take it again
                 rec.scan[f.path] = f.hash ?? "";
                 if (untouched) rec.base[f.path] = remotePlain;
@@ -680,8 +693,19 @@ export class MigrationService {
                 await this.savePendingCleanup(rec);
                 await this.ctx.log(`[Migration] ${path} was deleted late on another device: deleted it here too.`, "info");
             }
-            // Everything pushed into the old folder late is here now: the devices that
-            // follow from now on need not look into it (and it is about to go)
+            // Everything pushed into the old folder late is here now, and on the cloud
+            // once the sync has sent what was taken: only then the devices that follow
+            // need not look into the old folder any more (and it is about to go)
+            const unsent = await this.takenNotSent(rec);
+            this.cleanupWaitsForSync = unsent.length > 0;
+            if (unsent.length > 0) {
+                await this.savePendingCleanup(rec);
+                await this.ctx.log(
+                    `[Migration] ${unsent.length} late version(s) taken from the old folder are not on the cloud yet: the old folder is kept until they are.`,
+                    "info",
+                );
+                return;
+            }
             await this.markConversionCleaned(rec.skipped);
             await remoteDeletionOf(this.ctx).remove(
                 this.baseAdapter,
@@ -755,6 +779,24 @@ export class MigrationService {
         delete this.ctx.index[path];
         markIndexUploadOwed(this.ctx);
         await this.ctx.log(`[Migration] ${path} (left out on this device) was deleted late on another device: deleted it in the vault too.`, "info");
+    }
+
+    /**
+     * The versions the cleanup took that the converted vault on the cloud does not
+     * hold yet. One changed or deleted here since counts as sent once the sync has
+     * taken that change up (the note is no longer waiting to be sent).
+     */
+    private async takenNotSent(rec: PendingBackupCleanup): Promise<string[]> {
+        const unsent: string[] = [];
+        for (const [path, plain] of Object.entries(rec.taken ?? {})) {
+            const e = this.ctx.index[path];
+            const onCloud = e ? (e.plainHash ?? e.hash)?.toLowerCase() : undefined;
+            if (onCloud === plain.toLowerCase()) continue;
+            const here = await this.localHash(path);
+            if (here !== plain && !this.ctx.dirtyPaths.has(path) && (here === null ? !e : onCloud === here)) continue;
+            unsent.push(path);
+        }
+        return unsent;
     }
 
     private async markConversionCleaned(skipped?: Record<string, string>): Promise<void> {

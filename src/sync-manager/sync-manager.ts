@@ -790,7 +790,10 @@ export class SyncManager {
         // After a conversion: the old folder is checked and deleted once its grace time is over
         await this.migrationService.finishBackupCleanup();
         try {
-            return await _requestSmartSync(this as unknown as SyncContext, scanVault);
+            const result = await _requestSmartSync(this as unknown as SyncContext, scanVault);
+            // Late versions it took are on the cloud now: the cleanup can finish
+            if (this.migrationService.cleanupWaitsForSync) await this.migrationService.finishBackupCleanup();
+            return result;
         } catch (e) {
             if (e instanceof VaultFolderSwapError) return this.waitForFolderSwap(trigger);
             if (!isVaultFolderRestart(e) || restarts >= 2) throw e;

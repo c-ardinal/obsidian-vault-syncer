@@ -387,6 +387,13 @@ describe("Pushes into the old folder after the catch-up read it", () => {
         expect((await t.converted())["a.md"]).toBe("v1");
     });
 
+    /** What the sync after the cleanup does with a note it took: it sends it to the converted vault */
+    async function sent(t: Awaited<ReturnType<typeof lateEdit>>, path: string) {
+        const plain = await hashContent(t.local.get(path)!);
+        t.ctx.index[path] = { ...t.ctx.index[path], hash: plain, plainHash: plain } as (typeof t.ctx.index)[string];
+        t.ctx.dirtyPaths.delete(path);
+    }
+
     it("takes a late edit from the old folder, then deletes it", async () => {
         const t = await lateEdit({ "a.md": "v1", "b.md": "b1" }, (t) => t.drive.write(VAULT, "a.md", "late edit from B", t.idOf("a.md")));
         vi.setSystemTime(Date.now() + 2 * HOUR);
@@ -394,6 +401,10 @@ describe("Pushes into the old folder after the catch-up read it", () => {
         expect(t.localText("a.md")).toBe("late edit from B");
         expect(t.ctx.dirtyPaths.has("a.md")).toBe(true);
         expect(t.ctx.dirtyPaths.has("b.md")).toBe(false);
+        // Kept until the sync has sent the late edit: a device that follows meanwhile still finds it there
+        expect(t.drive.backupName()).toBeDefined();
+        await sent(t, "a.md");
+        await t.svc.finishBackupCleanup();
         expect(t.drive.backupName()).toBeUndefined();
         expect(t.local.has(".obsidian/plugins/x/data/local/migration-backup.json")).toBe(false);
     });
@@ -456,6 +467,8 @@ describe("Pushes into the old folder after the catch-up read it", () => {
         expect(t.drive.backupName()).toBeDefined();
         await t.svc.finishBackupCleanup();
         expect(t.localText("a.md")).toBe("late edit from B");
+        await sent(t, "a.md");
+        await t.svc.finishBackupCleanup();
         expect(t.drive.backupName()).toBeUndefined();
     });
 
@@ -499,6 +512,10 @@ describe("Pushes into the old folder after the catch-up read it", () => {
         vi.setSystemTime(Date.now() + 2 * HOUR);
         await fresh.finishBackupCleanup();
         expect(t.localText("a.md")).toBe("late edit from B");
+        await sent(t, "a.md");
+        // Started again before the next sync: the record on disk names what was taken
+        const again = new MigrationService(base, new VaultLockService(base), t.ctx);
+        await again.finishBackupCleanup();
         expect(t.drive.backupName()).toBeUndefined();
     });
 
